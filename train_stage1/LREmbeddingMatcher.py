@@ -1,443 +1,345 @@
-import os
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ESSD student / paired HQ-LQ structural distillation.
+
+Training logic:
+  LQ patch --E_S + Transformer--> y_i^S --shared prototype bank--> P_i^S
+  HQ patch --frozen E_img^T------> y_i^T --shared prototype bank--> P_i^T
+  q_i = 1 - H(P_i^T)/log(N_e)
+  L_ESSD = sum_i q_i KL(P_i^T || P_i^S) / sum_i q_i
+
+At inference only the LQ student branch and the frozen prototype bank are used.
+"""
+
+import pickle
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
 import numpy as np
-from torchvision import transforms, models
-import pickle
-from tqdm import tqdm
-
-import os
-import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
-from tqdm import tqdm
 
-import os
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from torchvision import transforms
-import pickle
-from tqdm import tqdm
-
-
-# ============================
-# 1) Patch Transformer 上下文化模块
-# ============================
 
 class PatchContextualizer(nn.Module):
-    """
-    对 patch-level embedding 进行上下文化建模：
-    输入: (N_patch, D)
-    输出: (N_patch, D)
-    """
     def __init__(self, dim, num_heads=4, num_layers=2, dropout=0.1):
         super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
+        layer = nn.TransformerEncoderLayer(
             d_model=dim,
             nhead=num_heads,
+            dim_feedforward=4 * dim,
             dropout=dropout,
-            batch_first=True
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
 
-    def forward(self, patch_embs):
-        """
-        patch_embs: (N, D)
-        返回上下文化后的 patch_embs
-        """
-        x = patch_embs.unsqueeze(0)        # (1, N, D)
-        x = self.transformer(x)            # (1, N, D)
-        return x.squeeze(0)                # (N, D)
+    def forward(self, patch_embs, padding_mask=None):
+        # patch_embs: [B,P,D] or [P,D]
+        squeeze = patch_embs.dim() == 2
+        if squeeze:
+            patch_embs = patch_embs.unsqueeze(0)
+        out = self.transformer(patch_embs, src_key_padding_mask=padding_mask)
+        return out.squeeze(0) if squeeze else out
 
 
-# ============================
-# 2) 主类：LREmbeddingMatcher（加入 Transformer）
-# ============================
+class PrototypeBank(nn.Module):
+    """Shared fixed prototype bank used by both HQ teacher and LQ student."""
 
-class LREmbeddingMatcher(nn.Module):
-    def __init__(self, img_encoder, prototype_lib_path, device='cuda',
-                 patch_size=128, stride=64, teacher_encoder=None,
-                 sid_list=None,
-                 use_transformer=True,          # ★ 新增参数
-                 transformer_dim=256,
-                 transformer_heads=4,
-                 transformer_layers=2):
-
+    def __init__(self, prototype_lib_path, entity_ids=None):
         super().__init__()
-        self.device = device
-        self.img_encoder = img_encoder.to(device)
-        self.img_encoder.train()
-        self.teacher_encoder = teacher_encoder.to(device).eval() if teacher_encoder else None
+        with open(prototype_lib_path, "rb") as f:
+            lib = pickle.load(f)
 
-        self.patch_size = patch_size
-        self.stride = stride
+        if entity_ids is None:
+            entity_ids = sorted(lib.keys(), key=lambda x: str(x))
+        self.entity_ids = [str(x) for x in entity_ids]
+        self.num_entities = len(self.entity_ids)
 
-        # ------------------- 原型库 -------------------
-        with open(prototype_lib_path, 'rb') as f:
-            self.prototype_lib = pickle.load(f)
+        proto_list = []
+        entity_index = []
+        for e, sid in enumerate(self.entity_ids):
+            items = lib.get(sid, lib.get(int(sid), [])) if sid.isdigit() else lib.get(sid, [])
+            if not items:
+                raise ValueError(f"No prototypes found for entity {sid}.")
+            for item in items:
+                emb = torch.as_tensor(item["embedding"], dtype=torch.float32)
+                proto_list.append(emb)
+                entity_index.append(e)
 
-        if sid_list is not None:
-            self.sid_list = list(sid_list)
+        prototypes = torch.stack(proto_list, dim=0)
+        prototypes = F.normalize(prototypes, dim=-1)
+        self.register_buffer("prototypes", prototypes)             # [K_all,D]
+        self.register_buffer(
+            "prototype_entity",
+            torch.tensor(entity_index, dtype=torch.long),
+        )                                                           # [K_all]
+
+    @property
+    def dim(self):
+        return self.prototypes.shape[-1]
+
+    def associate(self, embeddings, temperature=0.07):
+        """
+        embeddings: [...,D]
+        Returns:
+          entity_probs [...,E]
+          entity_scores [...,E]
+          proto_probs [...,K_all]
+
+        We first compute cosine similarity to all component prototypes, use the
+        strongest prototype response within each entity, and then normalize
+        across entities. Teacher and student use exactly the same operation.
+        """
+        embeddings = F.normalize(embeddings, dim=-1)
+        proto = F.normalize(self.prototypes, dim=-1)
+        sim = embeddings @ proto.t()                                # [...,K_all]
+        proto_probs = torch.softmax(sim / temperature, dim=-1)
+
+        scores = []
+        for e in range(self.num_entities):
+            mask = self.prototype_entity == e
+            if not torch.any(mask):
+                raise RuntimeError(f"Entity index {e} has no prototypes.")
+            # robust multiple-prototype entity response
+            scores.append(sim[..., mask].max(dim=-1).values)
+        entity_scores = torch.stack(scores, dim=-1)                 # [...,E]
+        entity_probs = torch.softmax(entity_scores / temperature, dim=-1)
+        return entity_probs, entity_scores, proto_probs
+
+
+class ESSDStudent(nn.Module):
+    """
+    LQ student with frozen HQ teacher and shared prototype bank.
+
+    img_encoder must map [N,C,patch,patch] -> [N,D].
+    teacher_encoder must map the paired HQ patches to the same D-dimensional
+    structural space. The teacher is frozen here.
+    """
+
+    def __init__(
+        self,
+        img_encoder,
+        teacher_encoder,
+        prototype_lib_path,
+        entity_ids=None,
+        patch_size=128,
+        stride=64,
+        embed_dim=256,
+        transformer_heads=4,
+        transformer_layers=2,
+        transformer_dropout=0.1,
+        proto_temperature=0.07,
+        device="cuda",
+    ):
+        super().__init__()
+        self.device = torch.device(device)
+        self.patch_size = int(patch_size)
+        self.stride = int(stride)
+        self.proto_temperature = float(proto_temperature)
+
+        self.student_encoder = img_encoder
+        self.teacher_encoder = teacher_encoder
+        self.prototype_bank = PrototypeBank(prototype_lib_path, entity_ids)
+
+        if self.prototype_bank.dim != embed_dim:
+            raise ValueError(
+                f"Prototype dimension {self.prototype_bank.dim} != embed_dim {embed_dim}."
+            )
+
+        self.contextualizer = PatchContextualizer(
+            embed_dim,
+            num_heads=transformer_heads,
+            num_layers=transformer_layers,
+            dropout=transformer_dropout,
+        )
+
+        # Teacher defines the structural space and must remain fixed in ESSD.
+        for p in self.teacher_encoder.parameters():
+            p.requires_grad_(False)
+        self.teacher_encoder.eval()
+
+        self.to(self.device)
+
+    @staticmethod
+    def _as_bchw(img):
+        """Convert numpy/tensor input to float BCHW in [0,1]."""
+        if isinstance(img, np.ndarray):
+            x = torch.from_numpy(img)
+        elif torch.is_tensor(img):
+            x = img
         else:
-            self.sid_list = sorted(list(self.prototype_lib.keys()), key=lambda x: str(x))
+            raise TypeError(f"Unsupported image type: {type(img)}")
 
-        # build prototype embeddings (num_proto x D)
-        self.prototype_embeddings = {}
-        self.prototype_counts = {}
-        self.prototype_centroids = {}
-
-        for sid in self.sid_list:
-            prototypes = self.prototype_lib.get(sid, [])
-            emb_arrays = []
-            centroids = []
-            for p in prototypes:
-                try:
-                    e = np.asarray(p["embedding"], dtype=np.float32)
-                    if e.ndim == 1:
-                        emb_arrays.append(e)
-                except:
-                    continue
-
-                c = p.get("centroid", None)
-                if c is not None:
-                    try:
-                        centroids.append((float(c[0]), float(c[1])))
-                    except:
-                        pass
-
-            if len(emb_arrays) == 0:
-                self.prototype_embeddings[sid] = None
-                self.prototype_counts[sid] = 0
-                self.prototype_centroids[sid] = None
-                continue
-
-            proto_mat = torch.from_numpy(np.stack(emb_arrays)).to(self.device)
-            proto_mat = F.normalize(proto_mat, p=2, dim=1)
-            self.prototype_embeddings[sid] = proto_mat
-            self.prototype_counts[sid] = proto_mat.shape[0]
-
-            if len(centroids) > 0:
-                xs = [c[0] for c in centroids]
-                ys = [c[1] for c in centroids]
-                self.prototype_centroids[sid] = (float(np.mean(xs)), float(np.mean(ys)))
-            else:
-                self.prototype_centroids[sid] = None
-
-        # ------------------- 图像归一化 -------------------
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-        ])
-
-        # ------------------- 上下文化 Transformer（可选） -------------------
-        self.use_transformer = use_transformer
-        if use_transformer:
-            self.contextualizer = PatchContextualizer(
-                dim=transformer_dim,
-                num_heads=transformer_heads,
-                num_layers=transformer_layers
-            ).to(device)
-
-        
-
-    # ------------------- Patch 提取 -------------------
-    def extract_patches(self, img):
-        # img expected H x W x C (numpy) or similar
-        # Defensive handling:
-        # - accept torch.Tensor (CPU/GPU), numpy arrays
-        # - accept batch tensors (B,C,H,W) or (B,H,W,C) -> use first sample
-        # - accept CHW (C,H,W) and convert to HWC
-        # - ensure numeric range is suitable for downstream transforms
-        # Normalize to a numpy H x W x C array (uint8 or float in [0,1])
-        arr = None
-        # 1) If torch tensor, move to cpu and convert
-        if isinstance(img, torch.Tensor):
-            try:
-                arr = img.detach().cpu().numpy()
-            except Exception:
-                # fallback to copying to cpu first
-                arr = img.detach().to('cpu').numpy()
+        if x.dim() == 2:
+            x = x.unsqueeze(0).unsqueeze(0)
+        elif x.dim() == 3:
+            # HWC or CHW
+            if x.shape[-1] in (1, 3) and x.shape[0] not in (1, 3):
+                x = x.permute(2, 0, 1)
+            x = x.unsqueeze(0)
+        elif x.dim() == 4:
+            # BHWC -> BCHW
+            if x.shape[-1] in (1, 3) and x.shape[1] not in (1, 3):
+                x = x.permute(0, 3, 1, 2)
         else:
-            arr = np.asarray(img)
+            raise ValueError(f"Unsupported image shape: {tuple(x.shape)}")
 
-        # 2) Handle batch dimension
-        if arr.ndim == 4:
-            # could be (B, C, H, W) or (B, H, W, C) -> pick first sample
-            if arr.shape[1] in (1, 3):
-                # assume BCHW
-                arr = arr[0]
-            else:
-                # assume BHWC
-                arr = arr[0]
+        x = x.float()
+        if x.numel() and x.max() > 1.5:
+            x = x / 255.0
+        return x.clamp(0, 1)
 
-        # 3) Now arr should be HWC or CHW or HW
-        if arr.ndim == 3:
-            # CHW -> HWC
-            if arr.shape[0] in (1, 3) and arr.shape[2] not in (1, 3):
-                arr = np.transpose(arr, (1, 2, 0))
-        elif arr.ndim == 2:
-            # HW -> HWC
-            arr = arr[:, :, None]
-        else:
-            raise ValueError(f'extract_patches: unsupported img shape {arr.shape}')
+    def _extract_patches(self, x):
+        """Aligned regular patch extraction. x is BCHW."""
+        b, c, h, w = x.shape
+        if h < self.patch_size or w < self.patch_size:
+            new_h = max(h, self.patch_size)
+            new_w = max(w, self.patch_size)
+            x = F.interpolate(x, size=(new_h, new_w), mode="bilinear", align_corners=False)
+            h, w = new_h, new_w
 
-        H, W, C = arr.shape
-        img = arr
+        patches = F.unfold(x, kernel_size=self.patch_size, stride=self.stride)
+        # [B,C*ps*ps,P] -> [B,P,C,ps,ps]
+        p = patches.shape[-1]
+        patches = patches.transpose(1, 2).reshape(
+            b, p, c, self.patch_size, self.patch_size
+        )
 
-        # 4) Heuristic: if float image in normalized range, convert to uint8 0-255
-        try:
-            if np.issubdtype(img.dtype, np.floating):
-                mx = float(np.nanmax(img))
-                mn = float(np.nanmin(img))
-                # common normalizations: [-0.5,0.5] or [0,1]
-                if mn >= -1.0 and mx <= 1.0:
-                    if mn < 0.0:
-                        # assume centered at 0 (e.g., [-0.5,0.5])
-                        img = ((img + 0.5) * 255.0).clip(0, 255).astype('uint8')
-                    else:
-                        # assume [0,1]
-                        img = (img * 255.0).clip(0, 255).astype('uint8')
-                else:
-                    # if values already in 0-255 but float, cast
-                    img = img.clip(0, 255).astype('uint8')
-        except Exception:
-            # if anything goes wrong, keep original
-            pass
+        coords = []
+        for y in range(0, h - self.patch_size + 1, self.stride):
+            for x0 in range(0, w - self.patch_size + 1, self.stride):
+                coords.append((x0, y))
+        return patches, coords
 
-        # If image is smaller than patch_size, resize it up to patch_size to guarantee at least one patch
-        if H < self.patch_size or W < self.patch_size:
-            try:
-                import cv2
-                img = cv2.resize(img, (self.patch_size, self.patch_size))
-                H, W, C = img.shape
-            except Exception:
-                # fallback: pad with zeros
-                new_img = np.zeros((self.patch_size, self.patch_size, C), dtype=img.dtype)
-                new_img[0:H, 0:W, ...] = img
-                img = new_img
-                H, W, C = img.shape
+    def _encode_student(self, lq_patches):
+        b, p, c, h, w = lq_patches.shape
+        flat = lq_patches.reshape(b * p, c, h, w)
+        emb = self.student_encoder(flat).reshape(b, p, -1)
+        emb = F.normalize(emb, dim=-1)
+        emb = self.contextualizer(emb)
+        # Important: Transformer changes feature norms; normalize again before
+        # cosine prototype association.
+        return F.normalize(emb, dim=-1)
 
-        patches = []
-        for y in range(0, H - self.patch_size + 1, self.stride):
-            for x in range(0, W - self.patch_size + 1, self.stride):
-                patch = img[y:y + self.patch_size, x:x + self.patch_size]
-                patches.append((patch, (x, y)))
-        return patches
+    @torch.no_grad()
+    def _encode_teacher(self, hq_patches):
+        b, p, c, h, w = hq_patches.shape
+        flat = hq_patches.reshape(b * p, c, h, w)
+        emb = self.teacher_encoder(flat).reshape(b, p, -1)
+        return F.normalize(emb, dim=-1)
 
-    # ------------------- 原型匹配 -------------------
-    def match_prototypes(self, patch_emb):
-        P = patch_emb.size(0)
-        E = len(self.sid_list)
-        device = patch_emb.device
+    def forward(self, lq_img, hq_img=None):
+        """
+        Inference:
+            out = model(lq_img)
+        ESSD training with paired observations:
+            out = model(lq_img, hq_img)
+        """
+        lq = self._as_bchw(lq_img).to(self.device)
+        lq_patches, coords = self._extract_patches(lq)
+        y_s = self._encode_student(lq_patches)
+        p_s, score_s, _ = self.prototype_bank.associate(
+            y_s, temperature=self.proto_temperature
+        )
 
-        raw_scores = torch.zeros((P, E), device=device, dtype=patch_emb.dtype)
-        for e, sid in enumerate(self.sid_list):
-            proto_tensor = self.prototype_embeddings.get(sid, None)
-            if proto_tensor is None:
-                raw_scores[:, e] = 0.0
-                continue
-            sim = torch.matmul(patch_emb, proto_tensor.t())  # (P x num_proto)
-            sid_score, _ = sim.max(dim=1)
-            raw_scores[:, e] = sid_score
+        out = {
+            "student_embeddings": y_s,
+            "student_probs": p_s,
+            "student_scores": score_s,
+            "patch_coords": coords,
+        }
 
-        if raw_scores.numel() == 0 or raw_scores.size(1) == 0:
-            entity_probs = torch.zeros((P, 0), device=device)
-        else:
-            entity_probs = torch.softmax(raw_scores, dim=1)
+        if hq_img is None:
+            return out
 
-        return entity_probs, raw_scores
+        hq = self._as_bchw(hq_img).to(self.device)
+        if hq.shape[-2:] != lq.shape[-2:]:
+            raise ValueError(
+                "ESSD requires spatially aligned HQ/LQ pairs with the same image size. "
+                f"Got LQ={tuple(lq.shape[-2:])}, HQ={tuple(hq.shape[-2:])}."
+            )
+        hq_patches, hq_coords = self._extract_patches(hq)
+        if hq_coords != coords:
+            raise RuntimeError("HQ/LQ patch grids are not aligned.")
 
-    # ------------------- Forward（加入 Transformer） -------------------
-    def forward(self, lr_img):
-        # Support both single-image inputs and batched inputs (Tensor BxCxHxW)
-        is_tensor = isinstance(lr_img, torch.Tensor)
-        if is_tensor and lr_img.dim() == 4:
-            B = lr_img.shape[0]
-            per_image_patch_embs = []
-            per_image_patch_coords = []
-            per_image_entity_probs = []
-            per_image_teacher_embs = []
+        with torch.no_grad():
+            y_t = self._encode_teacher(hq_patches)
+            p_t, score_t, _ = self.prototype_bank.associate(
+                y_t, temperature=self.proto_temperature
+            )
+            confidence = self.teacher_confidence(p_t)
 
-            for b in range(B):
-                sample = lr_img[b]
-                patches = self.extract_patches(sample)
-                coords = []
-                # batch encode patches for this image
-                if len(patches) == 0:
-                    # fallback: empty outputs
-                    per_image_patch_embs.append(torch.zeros((0, getattr(self.img_encoder, 'output_dim', 128)), device=self.device))
-                    per_image_entity_probs.append(torch.zeros((0, len(self.sid_list)), device=self.device))
-                    per_image_patch_coords.append([])
-                    if self.teacher_encoder:
-                        per_image_teacher_embs.append(torch.zeros((0, getattr(self.img_encoder, 'output_dim', 128)), device=self.device))
-                    continue
+        out.update(
+            {
+                "teacher_embeddings": y_t,
+                "teacher_probs": p_t,
+                "teacher_scores": score_t,
+                "confidence": confidence,
+            }
+        )
+        return out
 
-                patch_tensors = []
-                for patch, (x, y) in patches:
-                    coords.append((x, y))
-                    pt = self.transform(patch)
-                    patch_tensors.append(pt)
-                patch_tensors = torch.stack(patch_tensors, dim=0).to(self.device)
+    def teacher_confidence(self, teacher_probs, eps=1e-8):
+        """q_i = 1 - H(P_i^T)/log(N_e), in [0,1]."""
+        e = teacher_probs.shape[-1]
+        entropy = -(teacher_probs * torch.log(teacher_probs + eps)).sum(dim=-1)
+        denom = torch.log(torch.tensor(float(e), device=teacher_probs.device))
+        return (1.0 - entropy / (denom + eps)).clamp(0.0, 1.0)
 
-                # 确保特征提取主干在 eval 模式，避免 BN 在小批量/单补丁时报错
-                try:
-                    self.img_encoder.eval()
-                except Exception:
-                    pass
-                with torch.no_grad() if self.img_encoder is None else torch.enable_grad():
-                    patch_emb = self.img_encoder(patch_tensors)
-                patch_emb = F.normalize(patch_emb, p=2, dim=1)
+    def essd_loss(self, outputs, eps=1e-8):
+        """Uncertainty-weighted KL(P^T || P^S)."""
+        if "teacher_probs" not in outputs:
+            raise ValueError("Teacher outputs are required to compute ESSD loss.")
+        p_s = outputs["student_probs"]
+        p_t = outputs["teacher_probs"].detach()
+        q = outputs["confidence"].detach()
 
-                if self.use_transformer:
-                    patch_emb = self.contextualizer(patch_emb)
-
-                entity_probs, raw_scores = self.match_prototypes(patch_emb)
-
-                per_image_patch_embs.append(patch_emb)
-                per_image_entity_probs.append(entity_probs)
-                per_image_patch_coords.append(coords)
-
-                if self.teacher_encoder:
-                    with torch.no_grad():
-                        t_emb = self.teacher_encoder(patch_tensors)
-                        t_emb = F.normalize(t_emb, p=2, dim=1)
-                    per_image_teacher_embs.append(t_emb)
-
-            # stack per-image results into batch tensors
-            # assume all images have same number of patches L
-            Ls = [x.shape[0] for x in per_image_patch_embs]
-            if len(set(Ls)) != 1:
-                # if patch counts vary, pad with zeros to the max L
-                maxL = max(Ls)
-                D = per_image_patch_embs[0].shape[1] if Ls[0] > 0 else getattr(self.img_encoder, 'output_dim', 128)
-                padded_embs = []
-                padded_entities = []
-                padded_teachers = []
-                for i in range(B):
-                    Li = per_image_patch_embs[i].shape[0]
-                    if Li < maxL:
-                        pad = torch.zeros((maxL - Li, D), device=self.device)
-                        padded = torch.cat([per_image_patch_embs[i], pad], dim=0)
-                    else:
-                        padded = per_image_patch_embs[i]
-                    padded_embs.append(padded)
-
-                    Ei = per_image_entity_probs[i].shape[0]
-                    if Ei < maxL:
-                        pad_e = torch.zeros((maxL - Ei, per_image_entity_probs[i].shape[1]), device=self.device)
-                        padded_e = torch.cat([per_image_entity_probs[i], pad_e], dim=0)
-                    else:
-                        padded_e = per_image_entity_probs[i]
-                    padded_entities.append(padded_e)
-
-                    if self.teacher_encoder:
-                        Ti = per_image_teacher_embs[i].shape[0]
-                        if Ti < maxL:
-                            pad_t = torch.zeros((maxL - Ti, D), device=self.device)
-                            padded_t = torch.cat([per_image_teacher_embs[i], pad_t], dim=0)
-                        else:
-                            padded_t = per_image_teacher_embs[i]
-                        padded_teachers.append(padded_t)
-
-                batch_patch_embs = torch.stack(padded_embs, dim=0)
-                batch_entity_probs = torch.stack(padded_entities, dim=0)
-                batch_patch_coords = per_image_patch_coords
-                if self.teacher_encoder:
-                    batch_teacher_embs = torch.stack(padded_teachers, dim=0)
-            else:
-                batch_patch_embs = torch.stack(per_image_patch_embs, dim=0)
-                batch_entity_probs = torch.stack(per_image_entity_probs, dim=0)
-                batch_patch_coords = per_image_patch_coords
-                if self.teacher_encoder:
-                    batch_teacher_embs = torch.stack(per_image_teacher_embs, dim=0)
-
-            if self.teacher_encoder:
-                return batch_patch_embs, batch_patch_coords, batch_entity_probs, batch_teacher_embs
-            else:
-                return batch_patch_embs, batch_patch_coords, batch_entity_probs
-
-        # Single-image path (existing behavior)
-        patches = self.extract_patches(lr_img)
-
-        patch_coords = []
-        patch_embs = []
-        teacher_embs = []
-
-        # 1) 编码每个 patch
-        for patch, (x, y) in patches:
-            patch_tensor = self.transform(patch).unsqueeze(0).to(self.device)
-            try:
-                self.img_encoder.eval()
-            except Exception:
-                pass
-            patch_emb = self.img_encoder(patch_tensor)   # (1, D)
-            patch_emb = F.normalize(patch_emb, p=2, dim=1)
-
-            patch_embs.append(patch_emb)
-            patch_coords.append((x, y))
-
-            if self.teacher_encoder:
-                with torch.no_grad():
-                    t_emb = F.normalize(self.teacher_encoder(patch_tensor), p=2, dim=1)
-                teacher_embs.append(t_emb)
-
-        patch_embs = torch.cat(patch_embs, dim=0)  # (N, D)
-
-        # 2) Transformer 上下文化（最重要步骤）
-        if self.use_transformer:
-            patch_embs = self.contextualizer(patch_embs)
-
-        # 3) 匹配原型库
-        entity_probs, raw_scores = self.match_prototypes(patch_embs)
-
-        # 4) 返回 — 保持返回格式兼容
-        if self.teacher_encoder:
-            teacher_embs = torch.cat(teacher_embs, dim=0)
-            return patch_embs, patch_coords, entity_probs, teacher_embs
-        else:
-            return patch_embs, patch_coords, entity_probs
+        kl = F.kl_div(
+            torch.log(p_s + eps), p_t, reduction="none"
+        ).sum(dim=-1)                                                # [B,P]
+        return (q * kl).sum() / (q.sum() + eps)
 
 
-"""
-===================== 使用/训练示例 =====================
+# -----------------------------------------------------------------------------
+# Minimal training example
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    class TinyEncoder(nn.Module):
+        def __init__(self, out_dim=256):
+            super().__init__()
+            self.output_dim = out_dim
+            self.net = nn.Sequential(
+                nn.Conv2d(3, 64, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(64, 128, 3, padding=1),
+                nn.GELU(),
+                nn.AdaptiveAvgPool2d(1),
+            )
+            self.fc = nn.Linear(128, out_dim)
 
-# 1) 初始化 LR encoder + optional HR teacher
+        def forward(self, x):
+            return self.fc(self.net(x).flatten(1))
 
-lr_encoder = MyImageEncoder()
-hr_encoder = MyHRImageEncoder()  # 预训练权重
-matcher = LREmbeddingMatcher(lr_encoder, prototype_lib_path='prototype_lib.pkl',
-patch_size=128, stride=64, teacher_encoder=hr_encoder)
-
-# 2) 定义优化器
-
-optimizer = torch.optim.Adam(lr_encoder.parameters(), lr=1e-4)
-
-# 3) 训练循环（蒸馏）
-
-for epoch in range(num_epochs):
-for lr_img in dataloader:  # 逐图/逐 batch
-optimizer.zero_grad()
-patch_embs, teacher_embs, patch_coords = matcher(lr_img)
-# ----------------- 蒸馏 loss -----------------
-# L2 loss: LR embedding 对齐 HR embedding
-loss = F.mse_loss(patch_embs, teacher_embs)
-# 或者 CLIP-style contrastive loss，patch_embs 与 teacher_embs 为正样本
-loss.backward()
-optimizer.step()
-
-# 4) 推理/可视化
-
-# 调用示例（注意 match_prototypes 总是返回 (entity_probs, raw_scores)）
-patch_embs, patch_coords = matcher.forward(lr_img)
-entity_probs, raw_scores = matcher.match_prototypes(patch_embs)
-
-# 后续可生成 pixel-smoothed 或 patch-block 可视化
-
-========================================================
-"""
-
-
+    # Usage sketch only; replace paths and load the trained HQ teacher weights.
+    # student_encoder = TinyEncoder(256)
+    # teacher_encoder = TinyEncoder(256)
+    # teacher_encoder.load_state_dict(torch.load("teacher.pth", map_location="cpu"), strict=False)
+    # model = ESSDStudent(
+    #     student_encoder,
+    #     teacher_encoder,
+    #     "prototype_lib.pkl",
+    #     entity_ids=["0", "1", "2", "3"],
+    #     embed_dim=256,
+    # )
+    # optimizer = torch.optim.Adam(
+    #     list(model.student_encoder.parameters()) + list(model.contextualizer.parameters()),
+    #     lr=1e-4,
+    # )
+    # outputs = model(lq_batch, hq_batch)
+    # loss_essd = model.essd_loss(outputs)
+    # optimizer.zero_grad(set_to_none=True)
+    # loss_essd.backward()
+    # optimizer.step()
+    pass
